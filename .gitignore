@@ -1,0 +1,73 @@
+# ==============================================================================
+# Vigilia — Global .gitignore
+# ==============================================================================
+
+# ---- Environment Variables ---------------------------------------------------
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ---- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+htmlcov/
+.coverage
+.coverage.*
+
+# ---- Node.js -----------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ---- Build Outputs -----------------------------------------------------------
+dist/
+build/
+.next/
+out/
+
+# ---- IDE ---------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- OS Generated ------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ---- Docker Volumes (local) -------------------------------------------------
+docker-volumes/
+
+# ---- YOLO Models (large files) ----------------------------------------------
+*.pt
+*.onnx
+*.engine
+!modelo_IA/app/models/.gitkeep
+
+# ---- Videos / Media (large files) -------------------------------------------
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv

@@ -1,0 +1,25 @@
+=========================================
+DOCUMENTACIÓN DE CAMBIOS - MODELO IA
+=========================================
+Inicia la API de la IA abriendo una terminal en la carpeta modelo_IA:
+powershell
+
+.\venv\Scripts\Activate.ps1
+uvicorn app.main:app --host 0.0.0.0 --port 8001
+
+19/Sep/2026:
+- Actualización de `requirements.txt`: Se eliminaron las versiones estrictas de las librerías `numpy`, `scipy`, `ultralytics` y se cambió `lap` por `lapx` para asegurar la compatibilidad y correcta instalación en Python 3.14 sin requerir compiladores C++.
+- Entorno virtual (venv) configurado e inicializado exitosamente con las dependencias instaladas.
+- Módulos del Core (YOLO, Tracker, Behavior, Risk) implementados exitosamente:
+  - `detector.py`: Carga y rastreo con YOLO.
+  - `behavior.py`: Análisis de permanencia (loitering) y cálculo de velocidad.
+  - `risk_engine.py`: Motor de inferencia de riesgos basado en comportamiento.
+  - `pipeline.py`: Orquestador de procesamiento de video.
+- Añadido endpoint `/test-video` en `main.py` para probar la IA localmente subiendo un video.
+
+19/Sep/2026 (Segunda actualización):
+- **Refactorización Core (Detección de Somnolencia)**: 
+  - *Motivo del cambio*: El proyecto Vigilia está diseñado para detectar guardias de seguridad dormidos, no para detectar merodeo o intrusos moviéndose.
+  - `behavior.py`: Se modificó la lógica; ahora rastrea la **falta de movimiento** del centroide del bounding box (con un umbral de tolerancia) y cuenta los segundos de inactividad.
+  - `risk_engine.py`: El riesgo se dispara gradualmente desde 0 a 100 tras superar el umbral de sueño (ej. > 60 seg inactivo).
+  - `pipeline.py`: Se actualizó el OSD (On-Screen Display) para mostrar el tiempo de inactividad como `ZzZ: [segundos]s`.

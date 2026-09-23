@@ -1,0 +1,32 @@
+###############################################################################
+# Vigilia — Docker Compose Override (Desarrollo Local)
+# Estos valores sobreescriben docker-compose.yml solo en desarrollo.
+# Docker Compose carga este archivo automáticamente si existe.
+###############################################################################
+
+services:
+  # ---- modelo_IA: hot-reload con volume mount ---
+  modelo-ia:
+    volumes:
+      - ./modelo_IA:/app
+      - ia-models:/app/models
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # ---- backend: hot-reload con volume mount ---
+  backend:
+    volumes:
+      - ./backend:/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # ---- frontend: dev server con HMR ---
+  frontend:
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    environment:
+      - NODE_ENV=development
