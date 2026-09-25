@@ -14,8 +14,12 @@ services:
       dockerfile: Dockerfile
     container_name: vigilia-modelo-ia
     restart: unless-stopped
+    # Pipeline S1..S9 + Visualizador Byrack (python main_orchestrator.py).
+    # Camara: IP/RTSP configurada en modelo_IA/.env (RTSP_URL, RTSP_USER,
+    # RTSP_PASSWORD). No se mapea /dev/video0: la camara llega por red.
     ports:
-      - "${IA_PORT:-8001}:8001"
+      - "${IA_PORT:-8001}:8001"        # Visualizador: /stream, /snapshot.jpg, /api/state, /health
+      - "${ALERT_PORT:-8080}:8080"     # Servicio de alertas (UI de pruebas)
     volumes:
       - ./modelo_IA:/app
       - ia-models:/app/models          # Persistir modelos YOLO descargados
@@ -26,6 +30,13 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
+      - VISUALIZER_HOST=0.0.0.0        # dentro del contenedor; el host solo expone los puertos mapeados
+      - VISUALIZER_PORT=8001
+      - ALERT_HOST=0.0.0.0
+      - ALERT_PORT=8080
+      - ALERT_OPEN_BROWSER=false       # no hay navegador dentro del contenedor
+    # Tiempo para cerrar los clips de evidencia en curso al detener.
+    stop_grace_period: 30s
     depends_on:
       redis:
         condition: service_healthy

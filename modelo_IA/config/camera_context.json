@@ -1,0 +1,17 @@
+{
+  "CAM-01": {
+    "camera_type": "retail",
+    "site": "tienda_principal",
+    "utc_offset_hours": -6,
+    "zones": {
+      "pasillo": {"zone_type": "aisle", "name": "Pasillo"},
+      "caja": {"zone_type": "checkout", "name": "Caja"},
+      "salida": {"zone_type": "exit", "name": "Salida"},
+      "anaquel_1": {"zone_type": "shelf", "name": "Anaquel 1"}
+    },
+    "schedules": {
+      "business_hours": [["09:00", "21:00"]],
+      "closed": [["21:00", "09:00"]]
+    }
+  }
+}

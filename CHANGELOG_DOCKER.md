@@ -54,3 +54,34 @@
 - **GPU NVIDIA**: No disponible actualmente. La línea CUDA está **comentada** en `modelo_IA/Dockerfile`. Cuando tengas GPU, descomenta la línea `FROM nvidia/cuda:...` y comenta `FROM python:3.11-slim`.
 - **Versiones usadas**: Python 3.11, Node 20, PostgreSQL 16, MongoDB 7, Redis 7, RabbitMQ 3.
 - **Para levantar todo**: `docker compose up -d` desde la raíz del proyecto.
+
+---
+
+## 2026-09-24 — Pipeline de IA (S1..S9) + Visualizador Byrack (S10)
+
+### modelo_IA/
+
+| Archivo | Qué hace |
+|---------|----------|
+| `main_orchestrator.py` | Nuevo entry point: instancia S1..S9, los conecta con hilos "pump" y levanta el visualizador |
+| `IA/visualizer/visualizerService.py` | S10: dibuja tracks, esqueleto, comportamientos, alertas y evidencia sobre el frame original; MJPEG en `:8001/stream` |
+| `IA/*` | Carpetas renombradas sin guiones (`video_ingestion`, `yolo_detection`, …) + `__init__.py` para poder importarlas |
+| `IA/video_ingestion/videoService.py` | Cámara IP por RTSP activa (`RTSP_URL`, `RTSP_USER`, `RTSP_PASSWORD`); `frame_id` ya no se reinicia al reconectar |
+| `Dockerfile` / `requirements.txt` | Recreados: Python 3.11 (bookworm), torch CPU, OpenCV headless, Flask; `CMD python main_orchestrator.py` |
+| `.dockerignore` | Excluye `venv/`, `evidence_store/` y pesos del contexto de build |
+| `config/zones.json`, `config/camera_context.json` | Zonas de ejemplo (1920x1080) con los mismos `zone_id`; salida con merodeo a 3 s |
+| `.env.example` | Variables del pipeline |
+
+### Raíz
+
+| Archivo | Cambio |
+|---------|--------|
+| `docker-compose.yml` | `modelo-ia`: puerto 8080 (alertas), `VISUALIZER_HOST/ALERT_HOST=0.0.0.0`, `ALERT_OPEN_BROWSER=false`, `stop_grace_period: 30s` |
+| `docker-compose.override.yml` | `modelo-ia` arranca con `python main_orchestrator.py` (antes `uvicorn app.main:app`, que ya no existe) |
+| `.env.example` | `ALERT_PORT` |
+| `.gitignore` | `modelo_IA/evidence_store/` |
+
+### Notas
+
+- El puerto 8001 se mantiene: backend (`IA_SERVICE_URL`) y frontend (`/health`) ya apuntan ahí. Frontend: `<img src="http://localhost:8001/stream" />`.
+- Los pesos `yolov8n.pt` y `yolov8n-pose.pt` se descargan solos al primer arranque dentro del volumen `ia-models` (`AUTO_DOWNLOAD_MODELS=true`).

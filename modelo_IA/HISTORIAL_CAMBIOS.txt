@@ -23,3 +23,495 @@ uvicorn app.main:app --host 0.0.0.0 --port 8001
   - `behavior.py`: Se modificó la lógica; ahora rastrea la **falta de movimiento** del centroide del bounding box (con un umbral de tolerancia) y cuenta los segundos de inactividad.
   - `risk_engine.py`: El riesgo se dispara gradualmente desde 0 a 100 tras superar el umbral de sueño (ej. > 60 seg inactivo).
   - `pipeline.py`: Se actualizó el OSD (On-Screen Display) para mostrar el tiempo de inactividad como `ZzZ: [segundos]s`.
+
+
+
+
+
+
+Lo pruebo rápido con un video sintético para validar que el pipeline funciona de punta a punta.
+
+Elegí Python con OpenCV+FFmpeg porque es el ecosistema nativo de YOLO (Ultralytics). La decodificación corre en C y libera el GIL, así que un hilo por cámara escala bien sin complicarse con procesos.
+
+Las piezas principales del archivo:
+
+CameraStream: un hilo por cámara con conexión persistente. Si la cámara o el NVR se cae, se reconecta sola con backoff exponencial, sin afectar a las demás.
+Optimización: lee todos los paquetes para no acumular retraso. Solo convierte a imagen los que tocan según target_fps. Tiene detector de movimiento opcional, letterbox a 640 sin deformar, realce nocturno (CLAHE) y máscara de zona (ROI).
+FramePacket: cada frame viaja con camera_id, nombre, ubicación, tags, secuencia, timestamps y los datos para devolver las cajas de YOLO a coordenadas reales.
+FrameHub: guarda solo el frame más reciente de cada cámara. Así, si YOLO va lento, se descarta lo viejo en vez de acumular latencia, y ninguna cámara acapara el modelo.
+YoloWorker: hace la inferencia por lotes y llama a default_decision_handler(), que es donde pones tus reglas de negocio (ya trae un ejemplo de alerta por zona restringida).
+Salud: endpoints HTTP /health y /cameras para monitoreo o Docker, más métricas en log.
+
+Para arrancar:
+
+bash
+pip install opencv-python-headless numpy pyyaml ultralytics
+python video_service.py --print-example-config > cameras.yaml
+export NVR_USER=admin NVR_PASS='tu_contraseña'
+python video_service.py --config cameras.yaml
+
+El YAML de ejemplo ya trae las rutas típicas de Hikvision (/Streaming/Channels/102) y Dahua (subtype=1). Te recomiendo usar siempre el substream del NVR: para YOLO a 640 es suficiente y reduce mucho la carga.
+
+El diagrama (.mermaid) se abre en cualquier visor Mermaid, como mermaid.live o VS Code.
+
+
+------CAMBIO 24/09/2026   implemetacion de videoService -------
+
+Creado modelo_IA/IA/video-ingestion/videoServicie/videoService.py (compila sin errores de sintaxis).
+
+Resumen de lo implementado:
+- Abstracción: VideoSource (ABC) → LocalCameraSource (activa, vía cv2.VideoCapture), con RTSPCameraSource, NVRSource, DVRSource como stubs documentados que lanzan NotImplementedError, listos para implementarse sin tocar el pipeline.
+- Metadata: SourceMetadata con camera_id, source_type, session_id, stream_id, connection_state.
+- Máquina de estados: ConnectionState (DISCONNECTED/CONNECTING/CONNECTED/RECONNECTING/ERROR/STOPPED), gestionada en CameraWorker.
+- Reconexión: backoff exponencial con techo, máximo de intentos configurable, log de cada intento, liberación de recursos antes de reintentar.
+- Validación de frames: validate_raw_frame / validate_frame_identity; frames inválidos se descartan y loguean, nunca se propagan.
+- Frame normalizado: Frame dataclass con camera_id, frame_id incremental, session_id, stream_id, timestamp, payload de imagen.
+- Control de FPS: FpsThrottler hace muestreo matemático (intervalo objetivo) y mide FPS real de entrada.
+- Buffer: FrameBuffer, cola con maxlen estricto, política "descartar el más antiguo" (backpressure sin crecimiento ilimitado).
+- Shutdown controlado: CameraWorker.stop() detiene el hilo, libera la cámara, vacía el buffer.
+- Seguridad: sin credenciales hardcodeadas; el stub RTSP documenta uso de variables de entorno; nunca se loguean credenciales.
+- Logging: niveles DEBUG–CRITICAL, con rate-limiting (_RateLimitedLogger) para eventos de alta frecuencia como frames descartados.
+- Health check y métricas: health_check() y ServiceMetrics (FPS recibidos/entregados, descartados por causa, reconexiones, tiempo desde último frame, uso de buffer).
+- Contrato de salida: get_next_frame() y el generador frame_stream(), entregando solo el diccionario normalizado.
+- Ejecución independiente: bloque if __name__ == "__main__" para smoke test manual con la cámara local.
+
+No se importó ninguna librería de IA ni se implementó lógica de detección/tracking, conforme a la restricción negativa.
+
+
+----------HISTORIAL DE CAMBOS SERVICIO 2 PREPROSSESING 24/09/2026 --------
+Compila y el smoke test corre correctamente: recibió el frame sintético 1920x1080, aplicó letterboxing a 640x640 (scale 0.333, pad_y=140, pad_x=0) y entregó el contrato de salida completo con metadata de transformación.
+
+Creado modelo_IA/IA/preprocessing/preprocessingService/preprocessingService.py. Resumen:
+
+- Contrato de entrada: validate_input_frame exige camera_id, frame_id, session_id, timestamp, image (ndarray uint8, 1/3/4 canales) — descarta y loguea cualquier frame inválido sin propagarlo.
+- Normalización: normalize_color_and_dtype uniformiza a BGR de 3 canales uint8 sin importar la cámara de origen.
+- Resize + letterboxing: resize_with_letterbox mantiene aspect ratio con padding gris (114,114,114), evitando deformación.
+- ROI: ROI + apply_roi, validado contra límites del frame y un área máxima (_MAX_ROI_AREA_PX) para prevenir desbordamientos de memoria.
+- Metadata de transformación (TransformationMetadata): resolución original/procesada, scale_x/scale_y, pad_x/pad_y, ROI aplicado, conversión de color, dtype — todo lo que YOLO necesitará para la matemática inversa de bounding boxes.
+- Control de FPS: FpsThrottler por cámara (independiente de la de Ingestion), mide FPS de entrada y salida.
+- Configuración por cámara: CameraProcessingConfig (resolución objetivo, FPS objetivo, ROI, flags de calidad), actualizable en caliente vía update_config.
+- Stubs de calidad de imagen: _apply_quality_enhancements con denoise/brillo-contraste/nitidez comentados y listos para activar por config, sin romper el pipeline.
+- Concurrencia por cámara: PreprocessingWorker (un hilo + buffers propios por cámara) orquestado por PreprocessingService; una cámara lenta o rota no bloquea a las demás.
+- Backpressure: BoundedFrameQueue en entrada y salida, política "descartar el más antiguo", RAM acotada.
+- Robustez: errores de transformación, ROI inválido o excepciones no controladas se capturan por frame sin tumbar el worker ni el servicio.
+- Seguridad: nunca se loguean imágenes crudas/procesadas, solo metadata; ROI validado contra tamaño máximo.
+- Logging: niveles DEBUG–ERROR con rate-limiting para descartes de alta frecuencia.
+- Métricas y Health Check: CameraMetrics (recibidos/procesados/descartados por causa, latencia promedio) y PreprocessingService.health_check() (cámaras activas, uso de buffers, latencia global).
+- Contrato de salida: PreprocessedFrame.to_dict() — imagen procesada + camera_id/frame_id/session_id/timestamp + original_metadata + transformation_metadata.
+
+Restricción negativa respetada: sin librerías de IA, sin detección/tracking/lógica de negocio — es puramente transformación de matrices.
+
+
+----------HISTORIAL DE CAMBOS SERVICIO 3 YOLO DETECCTIO 24/09/2026 --------
+Compila y el smoke test confirma que la reproyección de coordenadas es matemáticamente correcta: una detección sintética en (160,160)-(480,480) sobre el frame procesado 640×640 (pad_y=140, scale=0.333) se proyectó a (480,60)-(1440,1020) en la imagen original de 1920×1080 — deshaciendo padding y escala correctamente.
+
+Creado modelo_IA/IA/yolo-detection/yoloDetectionService/yoloDetectionService.py. Resumen:
+
+- Contrato de entrada: validate_preprocessed_input exige camera_id, frame_id, session_id, timestamp, image, transformation_metadata (con scale_x/y, pad_x/y, original_width/height) — descarta y loguea lo inválido sin propagarlo.
+- Gestión del modelo (Singleton): get_inference_engine() carga el modelo una única vez por proceso, con lock para concurrencia. InferenceEngine (ABC) → UltralyticsEngine (activo, PyTorch/Ultralytics) + stubs ONNXRuntimeEngine y TensorRTEngine documentados y listos para implementarse sin tocar el resto del servicio.
+- Configuración por entorno: ModelConfig.from_env() — MODEL_PATH, MODEL_DEVICE, MODEL_PRECISION, MODEL_CONF_THRESHOLD, MODEL_IOU_THRESHOLD, MODEL_CLASS_WHITELIST, MODEL_MAX_BATCH_SIZE, MODEL_BATCH_TIMEOUT_MS. Ruta de modelo validada (validate_model_path) antes de cargar.
+- Dynamic Batcher multi-cámara: DynamicBatcher agrupa frames de distintas cámaras hasta max_batch_size o batch_timeout_ms (lo que ocurra primero), y despacha resultados 1:1 por orden de batch a la cola de salida de cada camera_id — sin mezclar cámaras (verificado con zip y chequeo de longitud).
+- Proyección inversa: reproject_bbox() deshace en orden correcto padding → escala → offset de ROI, con recorte defensivo a los límites de la imagen original.
+- NMS y filtrado: umbrales de confianza/IoU y whitelist de clases pasados al motor (NMS nativo de Ultralytics) + filtrado defensivo adicional antes de emitir.
+- Output contract: DetectionResult (sin imagen) con camera_id, session_id, frame_id, timestamp, model_info, inference_time_ms, lista de detections (detection_id, class_id, class_name, confidence intacta, bbox_original_coords).
+- VRAM OOM: InferenceOOMError capturada en _handle_oom → torch.cuda.empty_cache(), limpieza de colas, contador oom_events, log CRITICAL — el servicio sigue vivo.
+- Backpressure: BoundedQueue de entrada y por cámara en salida, política "descartar el más antiguo".
+- Seguridad: ruta de modelo validada, nada hardcodeado, jamás se loguean arrays de imagen.
+- Logging/Métricas/Health Check: niveles DEBUG–CRITICAL con rate-limiting; DetectionMetrics (FPS de inferencia, latencia promedio de batch, detecciones promedio/frame, OOMs); health_check() reporta estado de GPU/VRAM, modelo activo, uso de colas.
+
+Restricción negativa respetada: sin tracking, pose, comportamiento ni decisiones; las confianzas se entregan sin alterar.
+
+
+
+----------HISTORIAL DE CAMBOS SERVICIO 4 tracking 24/09/2026 --------
+
+Clean plain-Python floats now, JSON-serializable. Pipeline confirmed working: track created (NEW) at frame 1, confirmed (ACTIVE) at frame 2 per min_hits_to_confirm, and the Kalman filter smoothly tracks the moving bbox with growing position_history, all isolated to CAM-001.
+
+Creado modelo_IA/IA/tracking/trackingService/trackingService.py. Resumen:
+
+- Contrato de entrada: validate_detection_result exige camera_id, session_id, frame_id, timestamp, detections[] con class_id/class_name/confidence/bbox_original_coords — descarta lo inválido sin propagarlo.
+- Aislamiento multi-cámara: CameraTrackingWorker instancia un TrackerInterface propio por camera_id (hilo + buffers + diccionario de tracks separados). Los track_id se generan como f"{camera_id}-{seq}", estructuralmente imposible de cruzar entre cámaras.
+- Abstracción del algoritmo: TrackerInterface (ABC) → SortLikeTracker (activo: IoU + scipy.optimize.linear_sum_assignment + Kalman de velocidad constante) + stubs DeepSortTracker/BotSortTracker documentados, intercambiables vía create_tracker() sin tocar el resto del servicio.
+- Kalman + predicción: KalmanBoxTracker (estado [cx,cy,s,r,vx,vy,vs], estilo SORT) predice la posición esperada durante oclusiones, habilitando LOST con estimación de trayectoria.
+- Máquina de estados: NEW → ACTIVE (tras min_hits_to_confirm), ACTIVE/RECOVERING → LOST (sin match), LOST → RECOVERING → ACTIVE (reaparece y se confirma), LOST → TERMINATED (supera max_lost_frames).
+- Prevención de memory leaks: _cleanup_terminated() elimina del diccionario los tracks TERMINATED en el ciclo siguiente a emitir su evento final.
+- Historial: deque(maxlen=history_max_len) por track, centro calculado automáticamente desde el bbox filtrado; metadata first_seen, last_seen, frames_seen, frames_missing.
+- Output contract: TrackingResult con camera_id, session_id, frame_id, timestamp, y tracks[] (track_id, class_name, bbox, center, detection_confidence, track_state, first_seen, duration_seconds, position_history).
+- Concurrencia y backpressure: worker por cámara con BoundedQueue (descarta el más antiguo); además se descartan explícitamente frames con frame_id ≤ al último procesado (fuera de orden), ya que rompen la coherencia de velocidad del Kalman.
+- Logging/Métricas/Health Check: eventos clave logueados (track creado/recuperado/terminado); CameraTrackingMetrics (FPS de tracking, latencia de asignación, ID switches estimados como heurística de IoU débil, tracks activos); health_check() agrega por cámara y globalmente.
+
+Restricción negativa respetada: sin interpretación de comportamiento, sin alertas, sin ReID entre cámaras — solo asociación matemática de identidad dentro de cada cámara.
+
+
+
+----------HISTORIAL DE CAMBOS SERVICIO 5 POSE 26/09/2026 --------
+
+The target path is new (the existing modelo_IA/IA/pose folder is separate), so I'll create modelo_IA/IA/pose-specialized/poseService/poseService.py as specified.
+
+● Write(modelo_IA\IA\pose-specialized\poseService\poseService.py)
+Wrote 1330 lines to modelo_IA\IA\pose-specialized\poseService\poseService.py
+"""
+poseService.py
+
+Servicio de Pose / Specialized AI (Servicio 5 del pipeline).
+
+Responsabilidad UNICA: recibir TrackingResult (bboxes + track_id) desde
+"Tracking" (Servicio 4), recortar (crop) cada persona del frame original
+(enfoque Top-Down), ejecutar un modelo especializado de pose sobre los
+recortes, proyectar los keypoints de vuelta a coordenadas globales del frame
+y calcular señales geometricas derivadas (angulos articulares, inclinacion de
+… +1323 lines
+
+  Ran 1 shell command
+
+Creé modelo_IA/IA/pose-specialized/poseService/poseService.py. Compila, y lo probé con un modelo sintético porque no hay pesos de YOLOv8-Pose en el repo. Todavía no se ha ejecutado con un modelo real.
+
+La prueba con el modelo sintético dio los resultados esperados:
+- Proyección: el keypoint (40,40) del recorte, sumándole el origen del bbox (500,300), quedó en (540,340) en el frame completo.
+- Ángulos: el torso erguido dio 0°, y los codos doblados en L dieron 90° exactos.
+- Oclusión: los tobillos con confianza 0.1 salieron como visible: False con x/y nulos. Por eso el ángulo de rodilla sale None en vez de un valor falso.
+- Recorte inválido: un bbox en el borde (5×10 px) se marcó FAILED y el servicio siguió procesando a la otra persona.
+- Filtro por estado: el track LOST se ignoró; solo se procesan ACTIVE y NEW.
+
+Cómo funciona:
+- Acceso al frame: los bbox del Tracking están en coordenadas originales, así que el recorte se hace sobre el frame original de Video Ingestion, no sobre el de 640×640. El frame se pasa directo a submit_tracking_result(payload, frame) o se guarda antes con cache_frame(). Ese caché tiene tamaño limitado por cámara y libera los frames ya procesados.
+- Modelos: hay una interfaz SpecializedModelInterface con dos implementaciones reales:
+  - YoloPoseModel (Ultralytics, por defecto, procesa por lotes en GPU).
+  - MediaPipePoseModel (CPU, un recorte a la vez). Sus 33 puntos se traducen a los mismos 17 de COCO, así que la salida es igual con cualquiera de los dos.
+- Lotes: junta recortes de varias personas y cámaras en un solo lote, hasta max_batch_crops o hasta que pasa el tiempo límite. Si un recorte contiene a varias personas, se queda con el esqueleto de caja más grande.
+- Aislamiento de fallos: si un lote falla, reintenta recorte por recorte para que un recorte malo no arruine la pose de los demás. Si la GPU se queda sin memoria, libera la memoria, vacía la cola y marca esos tracks como FAILED sin detener el servicio.
+- Señales derivadas, todas numéricas (None si faltan puntos):
+  - Inclinación del torso con signo.
+  - Ángulos de codos, hombros, caderas y rodillas.
+  - Giro de la cabeza (head_yaw_ratio, head_yaw_deg), calculado con la nariz y las orejas.
+  - Proporción de keypoints visibles.
+- Colas: tienen tamaño limitado y descartan lo más antiguo. También se descartan los frames que llegan atrasados o fuera de orden en cada cámara.
+
+Se respetan las restricciones: no crea track_id nuevos, no produce etiquetas de comportamiento y no escribe imágenes en los logs.
+
+Para usarlo con el modelo real, pon POSE_MODEL_PATH apuntando a un .pt de pose (por ejemplo yolov8n-pose.pt). Si quieres el backend de CPU, instala mediapipe (no está en el venv) y pon POSE_BACKEND=MEDIAPIPE.
+
+✻ Crunched for 3m 7s · done 7:39 p.m.
+
+※ recap: We're building the AI pipeline one service file at a time, and services 1 through 5 (Pose) are written and passed tests using stand-in models. Next, point POSE_MODEL_PATH to a real pose model file and test it, or send the prompt for Service 6 (Behavior Engine).
+
+
+
+
+----------HISTORIAL DE CAMBOS SERVICIO 5 BEHAVIOR ENGINE 26/09/2026 --------
+
+
+Target is a new folder modelo_IA/IA/behavior-analysis/behaviorService/. Writing the service now.
+
+● Write(modelo_IA\IA\behavior-analysis\behaviorService\behaviorService.py)
+Wrote 1701 lines to modelo_IA\IA\behavior-analysis\behaviorService\behaviorService.py
+"""
+behaviorService.py
+
+Servicio de Behavior Analysis (Servicio 6 del pipeline).
+
+Responsabilidad UNICA: fusionar a traves del tiempo las trayectorias
+(TrackingResult, Servicio 4) y las señales posturales (SpecializedAIResult,
+Servicio 5) de cada individuo, y producir EVIDENCIA temporal de patrones de
+comportamiento (somnolencia, merodeo, interaccion con producto) hacia el
+"Decision Engine" (Servicio 7).
+… +1730 lines
+
+  Ran 1 shell command
+
+The scenario is working, but I noticed loitering measures displacement over the whole dwell time, letting an episode stay open too long after someone starts walking. I'll bound the check to a recent time window instead.
+
+● Update(modelo_IA\IA\behavior-analysis\behaviorService\behaviorService.py)
+Added 5 lines, removed 1 line
+        "sustain_min_coverage": 0.5,
+        "max_dispersion_body_heights": 1.5,
+        "still_dispersion_body_heights": 0.5,
+        "dispersion_window_seconds": 20.0,
+        "emit_interval_seconds": 2.0,
+    }
+
+    def evaluate(self, ctx: SubjectContext, now: float, params: Dict[str, object], mctx: ModuleContext
+) -> Evaluation:
+        min_dwell = float(params["min_dwell_seconds"])  # type: ignore[arg-type]
+        dwell = ctx.dwell_seconds(now)
+        dispersion = ctx.dispersion_radius(now, min(max(dwell, 1.0), ctx.window_seconds))
+        # Desplazamiento RECIENTE: si la persona empieza a caminar, el
+        # episodio se libera aunque siga dentro de la misma zona.
+        dispersion_window = min(max(dwell, 1.0), float(params["dispersion_window_seconds"]))  # type:
+ignore[arg-type]
+        dispersion = ctx.dispersion_radius(now, dispersion_window)
+
+        fusion = fuse_signals([
+            SignalReading("dwell_time", dwell, ramp(dwell, 0.5 * min_dwell, min_dwell), 0.5),
+
+  Ran 1 shell command
+
+Creé modelo_IA/IA/behavior-analysis/behaviorService/behaviorService.py. Compila, y lo probé con un escenario sintético de 40 s y 3 personas; los tiempos coinciden con lo diseñado.
+
+┌───────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────┐
+│       Qué pasó en la prueba       │                                  Resultado                                  │
+├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+│ T1, en el pasillo, visto de       │ somnolence pasó a POSSIBLE a los 4.4 s y a SUSTAINED a los 19.4 s (+15 s).  │
+│ espaldas (sin rostro), con la     │ Observabilidad 0.70, eye_closure marcado como faltante. Al caminar pasó a   │
+│ cabeza caída e inmóvil            │ FINISHED con duración de 26.2 s.                                            │
+├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+│ T1, merodeo con parámetros        │ POSSIBLE a los 8 s y SUSTAINED a los 14 s.                                  │
+│ acortados para la prueba          │                                                                             │
+├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+│ T2, inmóvil en zona_caja          │ Sin evidencia de merodeo, porque esa zona lo tiene desactivado. Tampoco hay │
+│                                   │  somnolencia, porque está erguido.                                          │
+├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+│ T3, con la mano en el anaquel de  │ POSSIBLE a los 5 s, SUSTAINED a los 7 s, FINISHED a los 11.4 s.             │
+│ t=5 a t=10                        │                                                                             │
+├───────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────┤
+│ T3 pasa a LOST en t=20            │ Tras los 5 s de gracia se liberó su memoria (subjects_collected: 1).        │
+└───────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────┘
+
+Cómo funciona:
+- Memoria temporal: cada persona tiene su propia ventana de historial de 60 s, con un tope de observaciones para que la memoria no crezca. Toda la lógica usa el timestamp de los frames, no el reloj del sistema, así que los resultados son reproducibles.
+- Fusión de Tracking y Pose: une ambos resultados por cámara y frame, esperando la pose hasta 150 ms. Si la pose llega tarde, se agrega después a la observación que le corresponde.
+- Pesos dinámicos: cada señal se puntúa entre 0 y 1. Si falta una, su peso se reparte entre las que sí están, y la observability indica qué fracción de la evidencia completa realmente se vio.
+  - Con poca observabilidad, un comportamiento puede quedar en POSSIBLE pero no subir a SUSTAINED.
+  - Si no se ve la nariz, la posición de la cabeza se mide con las orejas. Por eso detecta la cabeza caída aun viendo observability indica qué fracción de la evidencia completa realmente se vio.
+  - Con poca observabilidad, un comportamiento puede quedar en POSSIBLE pero no subir a SUSTAINED.
+  - Si no se ve la nariz, la posición de la cabeza se mide con las orejas. Por eso detecta la cabeza caída aun viendo a la persona de espaldas.
+- Módulos: BaseBehaviorModule contiene la máquina de estados (NORMAL → POSSIBLE → SUSTAINED → FINISHED), con umbrales distintos para entrar y salir y actualizaciones periódicas. Cada módulo (SleepingBehavior, LoiteringBehavior, ProductInteractionBehavior) solo define su evaluate().
+- Zonas: se configuran por cámara con polígonos, y cada zona puede ajustar o desactivar comportamientos (por ejemplo, desactivar el merodeo en la caja). Se pueden inyectar en caliente o cargar desde JSON con BEHAVIOR_ZONES_FILE.
+- LOST: el sujeto entra en RECOVERING durante 5 s. Si vuelve, sus comportamientos continúan donde estaban. Si no, se cierran como FINISHED indicando el motivo y se libera la memoria.
+- Preparado para ReID: link_identity() permite que un sistema externo una tracks de varias cámaras en un mismo individuo. Las señales de postura se combinan entre cámaras; las de movimiento solo usan la cámara más reciente, porque las coordenadas de cámaras distintas no son comparables.
+- Salida: BehaviorResult es solo evidencia: incluye evidence_strength, observability, evidence y una descripción del tipo "Evidencia de somnolencia sostenida durante 15.0 s". No genera alertas ni se conecta a ninguna base de datos.
+
+Hay algo que debes saber sobre el merodeo. Mide el desplazamiento de los últimos 20 s, así que alguien que camina despacio sin salir de la misma zona puede mantener el episodio abierto. Eso le pasó a T1 al final de la prueba, y es razonable porque ir y venir por un pasillo también es merodear. Si prefieres que se cierre antes, baja dispersion_window_seconds.
+
+
+
+
+----------HISTORIAL DE CAMBOS SERVICIO 7 DECISION ENGINE ENGINE 26/09/2026 --------
+
+
+Creé modelo_IA/IA/decision-engine/decisionService/decisionService.py. Compila y los 5 escenarios de prueba dieron lo esperado (probado con datos sintéticos, todavía no con salida real del Servicio 6).
+
+┌──────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────┐
+│                Escenario                 │                              Resultado                               │
+├──────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+│ Guardia dormido en el escritorio de      │ La ruta fue OBSERVATION → POSSIBLE_EVENT en t=15 (primera            │
+│ seguridad a las 23:30 hora local, con un │ confirmación) → EVENT_GENERATED en t=16 (segunda). La prioridad      │
+│  reporte de comportamiento por segundo   │ subió de HIGH a CRITICAL por turno nocturno. Los 23 reportes         │
+│                                          │ siguientes se descartaron por cooldown.                              │
+├──────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+│ Mismo BehaviorResult procesado dos veces │ Devuelve el mismo event_id, sin crear un segundo evento.             │
+├──────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+│ Posible robo: interacción con producto   │ POSSIBLE_THEFT con prioridad HIGH. El recorte de video va desde el   │
+│ en el pasillo y luego presencia en la    │ inicio de la interacción menos el margen previo hasta el final más   │
+│ salida                                   │ el margen posterior (83 s → 170 s).                                  │
+├──────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+│ Somnolencia en el pasillo                │ NO_EVENT, con el estado de cada regla en la explicación.             │
+├──────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
+│ Regla inválida (gt comparado con un      │ Se rechaza al cargar y las reglas vigentes siguen activas. El error  │
+│ texto)                                   │ aparece en el health check.                                          │
+└──────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────┘
+
+Cómo funciona:
+- Reglas declarativas: se escriben en JSON o YAML (DECISION_RULES_FILE) con condiciones anidadas (all/any/not y comparaciones como eq, gte, in, contains, between, exists), usando rutas como evidence.immobility_duration o context.zone_type. Se validan al cargar, no hay eval(), y se pueden recargar en caliente sin riesgo.
+- Dos tipos de regla:
+  - Simple: una condición sobre un solo BehaviorResult. Si defines un scope, la regla queda en OBSERVATION cuando la evidencia es relevante pero todavía no cumple.
+  - Secuencia: pasos en orden dentro de una ventana de tiempo, buscando hacia atrás en el historial de la persona. Un paso puede exigir cambio de zona (require_zone_change), que es cómo se representa el desplazamiento.
+- Contexto externo: por cámara se configuran el tipo de cámara, los tipos de zona y los horarios (incluidos los que cruzan medianoche) con su zona horaria (DECISION_CONTEXT_FILE). La prioridad puede subir según condiciones (priority_overrides).
+- Estados y cooldown: NORMAL → OBSERVATION → POSSIBLE_EVENT → EVENT_GENERATED, con un número configurable de confirmaciones antes de generar el evento. El cooldown se lleva por regla y por persona.
+- Idempotencia: guarda en caché los result_id ya procesados, y además el event_id es un UUIDv5 calculado a partir de la regla y del resultado de origen. Así, reprocesar el mismo resultado da el mismo id aunque ya no esté en caché.
+- Concurrencia: cada cámara tiene su propio bloqueo y siempre la atiende el mismo worker, lo que mantiene el orden por cámara y permite procesar varias cámaras en paralelo.
+- Explicación: cada evento incluye un resumen legible, la regla con su versión, las condiciones que se cumplieron con sus valores reales, las evidencias que lo sustentan, el contexto, cómo se escaló la prioridad y la ruta de estados.
+
+Tres puntos de diseño que debes saber:
+- Tiempos: cooldown y ventanas usan el timestamp de los datos, no el reloj del sistema, así que las decisiones son reproducibles.
+- Salidas NO_EVENT: se devuelven al llamar en modo síncrono, pero no se envían a la cola de salida para no saturar al Servicio 8. Si las necesitas allí, activa DECISION_PUBLISH_NO_EVENT=true.
+- Secuencias: solo ven lo que Behavior reporta. El paso "llegó a la salida" solo se cumple si Behavior emite algún comportamiento en esa zona (por ejemplo, el merodeo que abre episodio a los pocos segundos); si la persona atraviesa la salida sin detenerse, la secuencia no se completa.
+
+✻ Brewed for 4m 51s · done 8:14 p.m.
+
+
+
+----------HISTORIAL DE CAMBOS SERVICIO 8 EVIDENT SERVICE ENGINE 26/09/2026 --------
+9
+
+Target is a new folder modelo_IA/IA/event-evidence/evidenceService/ (existing event/ and evidence/ folders are left alone). Writing the service now.
+
+● Write(modelo_IA\IA\event-evidence\evidenceService\evidenceService.py)
+Wrote 1282 lines to modelo_IA\IA\event-evidence\evidenceService\evidenceService.py
+"""
+evidenceService.py
+
+Servicio de Event / Evidence (Servicio 8 del pipeline).
+
+Responsabilidad UNICA: recibir un DecisionResult (EVENT_GENERATED) desde el
+"Decision Engine" (Servicio 7), recolectar el video alrededor del evento
+(pre-roll desde un buffer circular + post-roll esperado de forma asincrona),
+ensamblar un clip, almacenarlo junto con su metadata de forma integra
+(SHA-256) y emitir un EvidenceResult hacia el "Alert Service" (Servicio 9).
+… +1297 lines
+
+  Ran 1 shell command
+
+Creé modelo_IA/IA/event-evidence/evidenceService/evidenceService.py. Compila, y lo probé con dos cámaras simuladas grabando a 10 fps en tiempo real. Para que la prueba fuera rápida usé ventanas cortas (3 s antes y 2 s después del evento); los valores por defecto son 15 s y 10 s.
+
+┌──────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────┐
+│       Caso       │                                          Resultado                                           │
+├──────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Posible robo en  │ submit_decision() regresó en 0.0 ms, sin esperar los segundos posteriores. Pasó CREATED →    │
+│ CAM-001          │ COLLECTING → PROCESSING → READY y generó un MP4 real de 49 frames (4.86 s, 97% de            │
+│                  │ cobertura). El SHA-256 del archivo coincide al recalcularlo.                                 │
+├──────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Mismo event_id   │ Mientras se procesa, devuelve la tarea existente; ya terminado, devuelve el estado READY. En │
+│ repetido         │  ningún caso crea una segunda tarea.                                                         │
+├──────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Evento de        │                                                                                              │
+│ CAM-002 al mismo │ Se procesó en paralelo con el anterior.                                                      │
+│  tiempo          │                                                                                              │
+├──────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Cámara sin video │ FAILED por insufficient_video. Aun así se envía el resultado, para que el Alert Service      │
+│                  │ pueda avisar sin clip.                                                                       │
+├──────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────┤
+│ NO_EVENT /       │                                                                                              │
+│ event_id que no  │ El primero se ignora sin error; el segundo se rechaza con el motivo.                         │
+│ es UUID          │                                                                                              │
+└──────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+Cómo funciona:
+- Sin bloquear al llamador: todo corre con asyncio en un hilo aparte. La espera del video posterior al evento es no bloqueante. Armar el clip y guardarlo corren en un pool de hilos, y un semáforo limita cuántos clips se arman a la vez porque consume mucha CPU.
+- Buffer de video: InMemoryRingBuffer guarda por cámara los frames recientes comprimidos en JPEG. Está limitado por tiempo y por bytes, y la ingesta lo alimenta con service.buffer.append_frame(...). Dejé la estructura preparada para NVR y Redis (NVRBufferManager, RedisBufferManager), sin activar.
+- Ventana del clip: siempre cubre al menos 15 s antes y 10 s después del evento. Si el Decision Engine pide una ventana más amplia (por ejemplo en secuencias), se respeta, con un tope de 120 s.
+- Video incompleto: si el video llega tarde, espera un margen extra y luego continúa con lo que haya. La metadata indica si faltó parte del inicio o del final; si la cobertura queda por debajo del 30%, el resultado es FAILED.
+- Almacenamiento: EvidenceStorageProvider con LocalFileStorage. Escribe los archivos de forma atómica, calcula el SHA-256 mientras copia, bloquea rutas que intenten salir de la carpeta y marca el video como solo lectura. S3EvidenceStorage quedó preparado como stub.
+- Idempotencia: se controla con el diccionario processing_events y una caché de eventos terminados. Además, el evidence_id se calcula a partir del event_id, así que tras un reinicio la evidencia ya guardada se recupera sin volver a generar el video.
+- Si no hay codec MP4: se guarda en un contenedor MJPEG propio en lugar de perder la evidencia.
+- Cierre: stop() espera a que terminen los eventos pendientes y marca como FAILED (service_shutdown) los que no alcancen a terminar.
+
+Un detalle que puede confundir: las carpetas por fecha usan UTC. Un evento a las 20:24 hora local quedó en la carpeta 2026-09-25.
+
+✻ Churned for 4m 20s · done 8:24 p.m.
+
+
+
+
+----------HISTORIAL DE CAMBOS SERVICIO 9 ALERT SERVICE 26/09/2026 --------
+
+
+Target is modelo_IA/IA/alert-service/alertService.py (flat file, per your path). One compatibility note up front: Service 8 writes MP4 with OpenCV's mp4v codec, which browsers can't play natively, so the page will detect the codec and fall back to a server-side MJPEG stream of the same clip. Writing it now.
+
+● Write(modelo_IA\IA\alert-service\alertService.py)
+Wrote 1022 lines to modelo_IA\IA\alert-service\alertService.py
+"""
+alertService.py
+
+Servicio de Alertas (Servicio 9 del pipeline) - MODO PRUEBAS LOCALES.
+
+Recibe EvidenceResult desde "Event / Evidence" (Servicio 8), los mantiene en
+memoria, levanta un servidor web ligero (http.server de la libreria estandar)
+en 127.0.0.1 y abre automaticamente el navegador en la alerta recibida.
+
+Entradas soportadas:
+… +1106 lines
+
+Two small hardening fixes before testing: insert the page body last so upstream text can never collide with template tokens, and make HEAD on the stream endpoint return headers only.
+
+● Update(modelo_IA\IA\alert-service\alertService.py)
+Added 5 lines, removed 3 lines
+
+
+def render_page(title: str, body: str, priority: str, state: Dict[str, Any]) -> str:
+    # BODY (que contiene texto del pipeline) se inserta al final para que
+    # ningun dato externo pueda coincidir con otro marcador de la plantilla.
+    return (PAGE_TEMPLATE
+            .replace("{{TITLE}}", esc(title))
+            .replace("{{CSS}}", BASE_CSS)
+            .replace("{{{PRIORITY_VARS}}}", "{" + _priority_vars(priority) + "}")
+            .replace("{{ICON_BRAND}}", ICON_BRAND)
+            .replace("{{BODY}}", body)
+            .replace("{{STATE}}", _json_for_script(state))
+            .replace("{{JS}}", BASE_JS))
+            .replace("{{JS}}", BASE_JS)
+            .replace("{{TITLE}}", esc(title))
+            .replace("{{BODY}}", body))
+
+
+def render_recent(alerts: List[Alert], active_id: Optional[str]) -> str:
+
+● Update(modelo_IA\IA\alert-service\alertService.py)
+Added 2 lines
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        delay = 1.0 / fps
+        deadline = time.time() + cfg.max_stream_seconds
+        while time.time() < deadline and not self.service.stopping:
+
+● Update(modelo_IA\IA\alert-service\alertService.py)
+Added 1 line, removed 1 line
+        import numpy as np
+    except ImportError:
+        return None
+    relative = f"{camera_id}/{datetime.utcnow().strftime('%Y-%m-%d')}/{evidence_id}.mp4"
+    relative = f"{camera_id}/{datetime.now(timezone.utc).strftime('%Y-%m-%d')}/{evidence_id}.mp4"
+    path = os.path.join(root, relative)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (640, 360))
+
+● Update(modelo_IA\IA\alert-service\alertService.py)
+Added 1 line, removed 2 lines
+import webbrowser
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from datetime import datetime
+from http import HTTPStatus
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
+
+Now starting the demo server (no browser) in the background to exercise every endpoint.
+
+  Ran 2 shell commands
+
+Endpoints all check out: the mp4v clip routes correctly to the MJPEG stream (~10 fps), checksums verify, and range requests return 206. Next I'll test POST ingestion, idempotency, and XSS escaping.
+
+  Ran 1 shell command
+
+Backend checks all pass. Stopping the test server.
+
+  Ran 1 shell command
+
+● Background command "Compile and start alert demo server in background" failed with exit code 127
+
+Creé modelo_IA/IA/alert-service/alertService.py. No abrí la página en un navegador, así que el diseño (el acomodo sin scroll y los colores por prioridad) no lo he visto. Lo que sí probé con peticiones HTTP contra el servidor funciona. (El aviso de "falló" de la tarea en segundo plano viene de que yo detuve el servidor de prueba.)
+
+Para verlo, ejecuta desde la raíz del repo:
+modelo_IA\venv\Scripts\python.exe modelo_IA\IA\alert-service\alertService.py --demo
+Crea 3 alertas simuladas (Crítica y Alta con video, Media sin video) y abre el navegador.
+
+Resultados de las pruebas:
+- Páginas: / redirige a la alerta más reciente. La alerta Crítica muestra el video y "Evidencia READY"; la que falló muestra un recuadro de "video no disponible" con el motivo.
+- Video: al abrir el MP4 se detectó el códec mp4v, que es el que usa el Servicio 8 y que los navegadores no reproducen. En su lugar el servidor envía el clip como stream MJPEG (~10 fps en la prueba). Si llega un H.264 se usa <video> normal, que también cambia al stream si el navegador no lo puede decodificar.
+- Integridad: el SHA-256 declarado se verificó contra el archivo.
+- Descarga parcial: /media/<id> responde 206 a peticiones con Range, lo que el reproductor necesita para adelantar el video.
+- Idempotencia: un POST repetido con el mismo event_id devolvió el mismo alert_id y no creó otra alerta.
+- Seguridad:
+  - Contenido malicioso en event_type o en la explicación se muestra como texto, no se ejecuta.
+  - Una video_reference que intenta salir de la carpeta de evidencias se rechaza.
+  - El servidor solo escucha en 127.0.0.1 y envía una CSP.
+  - POST incompleto → 400; sin Content-Type: application/json → 415.
+
+Cómo funciona:
+- Entrada: acepta alertas llamando a service.receive_evidence(dict) desde el mismo proceso, o con POST /api/evidence desde otro. Todo usa la librería estándar (http.server); OpenCV solo se usa para convertir el MP4 en stream.
+- Navegador: abre una pestaña al llegar una alerta, salvo que ya haya una página abierta. En ese caso la página, que consulta nuevas alertas cada 2 s, muestra un aviso, y si la alerta es Crítica cambia a ella automáticamente. Así se evita abrir muchas pestañas.
+- Interfaz: tema oscuro que ocupa toda la pantalla sin scroll:
+  - arriba, una banda con el color de la prioridad (Crítica rojo, Alta naranja, Media amarillo, Baja azul);
+  - debajo, el video con la cámara superpuesta y sus datos (inicio, fin, duración, tamaño);
+  - al lado, los detalles: IDs con botón de copiar, la regla activada y su explicación, una barra de cobertura y el estado de integridad;
+  - a la derecha, la lista de alertas recientes.
+- Memoria: las alertas viven en memoria (máximo 100) mientras corre el proceso; no hay base de datos.
+
+Para usarlo con el Servicio 8 real, pasa --evidence-root (o la variable EVIDENCE_STORAGE_ROOT) apuntando a la misma carpeta que usa el Servicio 8, para que encuentre los videos.
+
+✻ Crunched for 4m 52s · done 8:36 p.m.

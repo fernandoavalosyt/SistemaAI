@@ -5,12 +5,12 @@
 ###############################################################################
 
 services:
-  # ---- modelo_IA: hot-reload con volume mount ---
+  # ---- modelo_IA: codigo montado; reiniciar el contenedor para aplicar cambios ---
   modelo-ia:
     volumes:
       - ./modelo_IA:/app
       - ia-models:/app/models
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+    command: ["python", "main_orchestrator.py"]
     environment:
       - PYTHONUNBUFFERED=1
 

@@ -1,0 +1,23 @@
+# Entorno local (varios GB) y artefactos: nunca al contexto de build
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Datos generados en ejecucion
+evidence_store/
+
+# Pesos: se montan en /app/models (volumen ia-models) o se descargan al arrancar
+models/*.pt
+models/*.onnx
+models/*.engine
+
+# Secretos
+.env
+.env.*
+!.env.example
+
+# Legado / documentacion
+HISTORIAL_CAMBIOS.txt
+Dockerfile
+.dockerignore

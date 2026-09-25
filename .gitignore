@@ -65,6 +65,9 @@ docker-volumes/
 *.engine
 !modelo_IA/app/models/.gitkeep
 
+# ---- Evidencias generadas por el pipeline ------------------------------------
+modelo_IA/evidence_store/
+
 # ---- Videos / Media (large files) -------------------------------------------
 *.mp4
 *.avi
